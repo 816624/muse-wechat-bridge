@@ -1,0 +1,504 @@
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
+import path from "node:path";
+import { WxbError } from "./errors.js";
+import { generateClientId, IlinkClient } from "./ilink-client.js";
+import { outgoingItemTypes, protocolDefaults, uploadMediaTypes } from "./protocol-constants.js";
+import { resolveSendAccount, resolveTargetUserOrAlias } from "./send-text.js";
+import { sanitizeAttachmentFileName } from "./media-download.js";
+import { withOptionalTyping } from "./typing.js";
+import { resolveContextToken } from "../state/context-token-store.js";
+import { appendMessageHistory } from "../state/message-history.js";
+import { withAccountLock } from "../state/lock.js";
+import { probeAudioMetadata, probeVideoMetadata } from "./video-metadata.js";
+
+const mediaTypeByKind = Object.freeze({
+  image: uploadMediaTypes.image,
+  file: uploadMediaTypes.file,
+  video: uploadMediaTypes.video,
+  voice: uploadMediaTypes.voice
+});
+
+const mimeByExtension = Object.freeze({
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".mp4": "video/mp4",
+  ".mov": "video/quicktime",
+  ".webm": "video/webm",
+  ".silk": "audio/silk",
+  ".mp3": "audio/mpeg",
+  ".wav": "audio/wav",
+  ".m4a": "audio/mp4",
+  ".ogg": "audio/ogg",
+  ".pdf": "application/pdf",
+  ".txt": "text/plain",
+  ".md": "text/markdown",
+  ".json": "application/json",
+  ".csv": "text/csv",
+  ".zip": "application/zip",
+  ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".ppt": "application/vnd.ms-powerpoint",
+  ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+});
+
+function inferMimeType(filePath) {
+  return mimeByExtension[path.extname(filePath).toLowerCase()];
+}
+
+function md5Hex(buffer) {
+  return createHash("md5").update(buffer).digest("hex");
+}
+
+function encryptAes128Ecb(buffer, key) {
+  const cipher = createCipheriv("aes-128-ecb", key, null);
+  return Buffer.concat([cipher.update(buffer), cipher.final()]);
+}
+
+function resolveUploadParam(response = {}) {
+  return response.upload_param
+    ?? response.uploadParam
+    ?? response.data?.upload_param
+    ?? response.data?.uploadParam;
+}
+
+function buildCdnUploadUrl({ cdnBaseUrl, uploadParam, fileKey }) {
+  const url = new URL("upload", cdnBaseUrl.endsWith("/") ? cdnBaseUrl : `${cdnBaseUrl}/`);
+  url.searchParams.set("encrypted_query_param", uploadParam);
+  url.searchParams.set("filekey", fileKey);
+  return url.toString();
+}
+
+function resolveUploadUrl(response = {}, { cdnBaseUrl, fileKey } = {}) {
+  const directUrl = response.upload_url
+    ?? response.uploadUrl
+    ?? response.url
+    ?? response.cdn_upload_url
+    ?? response.cdnUploadUrl
+    ?? response.upload_info?.url
+    ?? response.uploadInfo?.url
+    ?? response.data?.upload_url
+    ?? response.data?.uploadUrl
+    ?? response.data?.url
+    ?? response.data?.upload_info?.url
+    ?? response.data?.uploadInfo?.url;
+  if (directUrl) {
+    return directUrl;
+  }
+
+  const uploadParam = resolveUploadParam(response);
+  if (uploadParam) {
+    return buildCdnUploadUrl({
+      cdnBaseUrl: cdnBaseUrl ?? protocolDefaults.cdnBaseUrl,
+      uploadParam,
+      fileKey
+    });
+  }
+
+  return undefined;
+}
+
+function resolveDownloadParam(response = {}) {
+  return response.headers?.["x-encrypted-param"]
+    ?? response.headers?.["X-Encrypted-Param"]
+    ?? response.body?.encrypt_query_param
+    ?? response.body?.encryptQueryParam
+    ?? response.body?.download_param
+    ?? response.body?.downloadParam
+    ?? response.body?.data?.encrypt_query_param
+    ?? response.body?.data?.encryptQueryParam
+    ?? response.body?.data?.download_param
+    ?? response.body?.data?.downloadParam;
+}
+
+function resolveUploadConfigDownloadParam(response = {}) {
+  return response.upload_url
+    ? undefined
+    : response.encrypt_query_param
+      ?? response.encryptQueryParam
+      ?? response.download_param
+      ?? response.downloadParam
+      ?? response.data?.encrypt_query_param
+      ?? response.data?.encryptQueryParam
+      ?? response.data?.download_param
+      ?? response.data?.downloadParam;
+}
+
+function encodeMediaAesKey(aesKeyHex) {
+  return Buffer.from(aesKeyHex).toString("base64");
+}
+
+async function inspectLocalMedia(filePath, kind, config = {}) {
+  const absolutePath = path.resolve(filePath ?? "");
+  let info;
+
+  try {
+    info = await stat(absolutePath);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      throw new WxbError("MEDIA_FILE_NOT_FOUND", "Media file does not exist.", {
+        retryable: false,
+        details: { path: absolutePath }
+      });
+    }
+    throw error;
+  }
+
+  if (!info.isFile()) {
+    throw new WxbError("MEDIA_PATH_NOT_FILE", "Media path must point to a regular file.", {
+      retryable: false,
+      details: { path: absolutePath }
+    });
+  }
+
+  const maxUploadBytes = config.maxUploadBytes ?? 25 * 1024 * 1024;
+  if (info.size > maxUploadBytes) {
+    throw new WxbError("MEDIA_FILE_TOO_LARGE", "Media file exceeds the configured upload size limit.", {
+      retryable: false,
+      details: {
+        path: absolutePath,
+        bytes: info.size,
+        maxUploadBytes
+      }
+    });
+  }
+
+  const mimeType = inferMimeType(absolutePath);
+  const mimePrefixByKind = {
+    image: "image/",
+    video: "video/",
+    voice: "audio/"
+  };
+  const requiredPrefix = mimePrefixByKind[kind];
+  if (!mimeType || (requiredPrefix && !mimeType.startsWith(requiredPrefix))) {
+    throw new WxbError("MEDIA_TYPE_UNSUPPORTED", "Media MIME type could not be inferred or is not supported for this send mode.", {
+      retryable: false,
+      details: {
+        path: absolutePath,
+        kind,
+        extension: path.extname(absolutePath).toLowerCase() || undefined
+      }
+    });
+  }
+
+  const bytes = await readFile(absolutePath);
+  return {
+    path: absolutePath,
+    bytes,
+    rawSize: bytes.length,
+    rawMd5: md5Hex(bytes),
+    fileName: sanitizeAttachmentFileName(path.basename(absolutePath)),
+    mimeType
+  };
+}
+
+function buildUploadRequest({ fileKey, mediaType, targetUserId, local, encryptedBytes, aesKeyHex }) {
+  return {
+    filekey: fileKey,
+    media_type: mediaType,
+    to_user_id: targetUserId,
+    rawsize: local.rawSize,
+    rawfilemd5: local.rawMd5,
+    filesize: encryptedBytes.length,
+    thumb_rawsize: 0,
+    thumb_rawfilemd5: "",
+    thumb_filesize: 0,
+    no_need_thumb: true,
+    aeskey: aesKeyHex
+  };
+}
+
+function buildCdnMedia({ downloadParam, aesKeyHex }) {
+  return {
+    encrypt_query_param: downloadParam,
+    aes_key: encodeMediaAesKey(aesKeyHex),
+    encrypt_type: 1
+  };
+}
+
+function buildMediaItem({ kind, local, encryptedBytes, aesKeyHex, downloadParam, videoMetadata = {}, audioMetadata = {} }) {
+  if (kind === "image") {
+    return {
+      type: outgoingItemTypes.image,
+      image_item: {
+        media: {
+          ...buildCdnMedia({ downloadParam, aesKeyHex })
+        },
+        mid_size: encryptedBytes.length
+      }
+    };
+  }
+
+  if (kind === "voice") {
+    // Voice item mirrors the video item shape and the fields the normalizer
+    // reads back from inbound voice items (file_name/md5/len/duration_ms).
+    // WeChat voice messages are natively SILK (audio/silk, as delivered
+    // inbound); common audio files (.mp3/.wav/.m4a/.ogg) are also accepted
+    // by the MIME check, but whether the server transcodes or plays them
+    // as voice is unverified without a live fixture — prefer .silk.
+    // No thumbnail is attached; the upload request carries no_need_thumb
+    // as documented for the upload endpoint.
+    return {
+      type: outgoingItemTypes.voice,
+      voice_item: {
+        media: {
+          ...buildCdnMedia({ downloadParam, aesKeyHex })
+        },
+        file_name: local.fileName,
+        md5: local.rawMd5,
+        len: String(local.rawSize),
+        ...(audioMetadata.durationMs !== undefined ? { duration_ms: audioMetadata.durationMs } : {})
+      }
+    };
+  }
+
+  if (kind === "video") {
+    // Video item mirrors the shape the normalizer reads back from inbound
+    // video messages (media + file_name/md5/len + duration/width/height).
+    // The upload request already carries no_need_thumb: the requirements doc
+    // documents `no_need_thumb: 1` as a supported upload parameter, so no
+    // thumbnail is attached. If the server or the receiving client ever
+    // requires a thumbnail, a live fixture is needed to learn the thumb
+    // upload shape; the current upload flow has no second upload call.
+    return {
+      type: outgoingItemTypes.video,
+      video_item: {
+        media: {
+          ...buildCdnMedia({ downloadParam, aesKeyHex })
+        },
+        file_name: local.fileName,
+        md5: local.rawMd5,
+        len: String(local.rawSize),
+        ...(videoMetadata.duration !== undefined ? { duration: videoMetadata.duration } : {}),
+        ...(videoMetadata.width !== undefined ? { width: videoMetadata.width } : {}),
+        ...(videoMetadata.height !== undefined ? { height: videoMetadata.height } : {})
+      }
+    };
+  }
+
+  return {
+    type: outgoingItemTypes.file,
+    file_item: {
+      media: {
+        ...buildCdnMedia({ downloadParam, aesKeyHex })
+      },
+      file_name: local.fileName,
+      md5: local.rawMd5,
+      len: String(local.rawSize)
+    }
+  };
+}
+
+export async function sendMedia(options = {}) {
+  const {
+    stateDir,
+    accountId,
+    userId,
+    filePath,
+    kind = "file",
+    config = {},
+    client: providedClient,
+    timeoutMs = config.fetchTimeoutMs,
+    typing = false
+  } = options;
+
+  if (!stateDir) {
+    throw new TypeError("stateDir is required");
+  }
+
+  if (!["file", "image", "video", "voice"].includes(kind)) {
+    throw new WxbError("MEDIA_KIND_UNSUPPORTED", "Only file, image, video, and voice sends are supported.", {
+      retryable: false,
+      details: { kind }
+    });
+  }
+
+  const targetUserId = await resolveTargetUserOrAlias(stateDir, {
+    userId,
+    alias: options.alias
+  });
+  const account = await resolveSendAccount(stateDir, accountId);
+  const local = await inspectLocalMedia(filePath, kind, config);
+  // Media metadata is best-effort: probing never blocks the send. Custom
+  // probes can be injected for tests via options.videoMetadataProbe /
+  // options.audioMetadataProbe.
+  const videoMetadata = kind === "video"
+    ? await (options.videoMetadataProbe ?? probeVideoMetadata)(filePath)
+    : {};
+  const audioMetadata = kind === "voice"
+    ? await (options.audioMetadataProbe ?? probeAudioMetadata)(filePath)
+    : {};
+  const client = providedClient ?? new IlinkClient({
+    baseUrl: account.baseUrl ?? config.baseUrl,
+    channelVersion: config.channelVersion
+  });
+
+  return withAccountLock(stateDir, account.accountId, async () => {
+    const contextToken = await resolveContextToken(stateDir, account.accountId, targetUserId);
+    if (!contextToken) {
+      throw new WxbError("NO_CONTEXT_TOKEN", "No context token is cached for this user; fetch an inbound message first.", {
+        retryable: false,
+        details: {
+          accountId: account.accountId,
+          userId: targetUserId
+        }
+      });
+    }
+
+    return withOptionalTyping({
+      enabled: typing,
+      client,
+      token: account.token,
+      stateDir,
+      accountId: account.accountId,
+      userId: targetUserId,
+      contextToken,
+      timeoutMs
+    }, async (activeContextToken) => {
+      const clientId = generateClientId();
+      const aesKey = randomBytes(16);
+      const aesKeyHex = aesKey.toString("hex");
+      const encryptedBytes = encryptAes128Ecb(local.bytes, aesKey);
+      const fileKey = randomBytes(16).toString("hex");
+      const uploadRequest = buildUploadRequest({
+        fileKey,
+        mediaType: mediaTypeByKind[kind],
+        targetUserId,
+        local,
+        encryptedBytes,
+        aesKeyHex
+      });
+      const uploadConfig = await client.getUploadUrl({
+        token: account.token,
+        upload: uploadRequest,
+        timeoutMs
+      });
+      const uploadUrl = resolveUploadUrl(uploadConfig, {
+        cdnBaseUrl: config.cdnBaseUrl,
+        fileKey
+      });
+
+      if (!uploadUrl) {
+        throw new WxbError("MEDIA_UPLOAD_URL_MISSING", "iLink did not return a media upload URL.", {
+          retryable: false,
+          details: { kind, fileName: local.fileName }
+        });
+      }
+
+      let uploadResponse;
+      try {
+        uploadResponse = await client.uploadBytes({
+          uploadUrl,
+          bytes: encryptedBytes,
+          contentType: "application/octet-stream",
+          timeoutMs
+        });
+      } catch (error) {
+        if (error instanceof WxbError) {
+          throw error;
+        }
+        throw new WxbError("MEDIA_UPLOAD_FAILED", "Media upload failed.", {
+          retryable: true,
+          details: { cause: error?.message ?? String(error) }
+        });
+      }
+
+      const downloadParam = resolveDownloadParam(uploadResponse) ?? resolveUploadConfigDownloadParam(uploadConfig);
+      if (!downloadParam) {
+        throw new WxbError("MEDIA_UPLOAD_PARAM_MISSING", "CDN upload did not return an encrypted media download parameter.", {
+          retryable: false,
+          details: { kind, fileName: local.fileName }
+        });
+      }
+
+      const item = buildMediaItem({
+        kind,
+        local,
+        encryptedBytes,
+        aesKeyHex,
+        downloadParam,
+        videoMetadata,
+        audioMetadata
+      });
+
+      try {
+        await client.sendMediaMessage({
+          token: account.token,
+          toUserId: targetUserId,
+          item,
+          contextToken: activeContextToken,
+          clientId,
+          timeoutMs
+        });
+      } catch (error) {
+        if (!(error instanceof WxbError)) {
+          throw error;
+        }
+        throw new WxbError(error.code, error.message, {
+          retryable: error.retryable,
+          status: error.status,
+          details: {
+            ...(error.details ?? {}),
+            uploaded: true,
+            clientId,
+            kind,
+            fileName: local.fileName
+          }
+        });
+      }
+
+      const historyEntry = {
+        id: clientId,
+        direction: "outgoing",
+        fromUserId: account.ownerUserId,
+        toUserId: targetUserId,
+        timestamp: Math.floor(Date.now() / 1000),
+        type: kind,
+        contextToken: activeContextToken,
+        attachment: {
+          kind,
+          fileKey,
+          fileName: local.fileName,
+          mimeType: local.mimeType,
+          bytes: local.rawSize,
+          encrypted: true,
+          uploaded: true
+        }
+      };
+
+      try {
+        await appendMessageHistory(stateDir, account.accountId, historyEntry);
+      } catch (error) {
+        throw new WxbError("OUTGOING_HISTORY_WRITE_FAILED", "Media was sent but local outgoing history could not be written.", {
+          retryable: false,
+          details: {
+            delivered: true,
+            sentCount: 1,
+            clientId,
+            cause: error?.message ?? String(error)
+          }
+        });
+      }
+
+      return {
+        accountId: account.accountId,
+        toUserId: targetUserId,
+        kind,
+        clientId,
+        fileName: local.fileName,
+        mimeType: local.mimeType,
+        bytes: local.rawSize,
+        encryptedBytes: encryptedBytes.length,
+        uploaded: true,
+        sent: true,
+        ...(kind === "video" ? { videoMetadata } : {}),
+        ...(kind === "voice" ? { audioMetadata } : {})
+      };
+    });
+  });
+}
